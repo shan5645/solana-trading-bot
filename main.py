@@ -2,7 +2,7 @@ import os
 import asyncio
 import aiohttp
 from datetime import datetime
-from telegram import Update
+from telegram import Update, BotCommand
 from telegram.ext import Application, CommandHandler, ContextTypes
 import json
 
@@ -421,6 +421,20 @@ def main():
     
     # Start the monitoring task in the background
     async def post_init(app: Application):
+        # Set bot commands for the menu
+        commands = [
+            BotCommand("start", "🏠 Start the bot & see welcome message"),
+            BotCommand("add", "➕ Add a wallet to track"),
+            BotCommand("remove", "➖ Remove a tracked wallet"),
+            BotCommand("list", "📋 Show all tracked wallets"),
+            BotCommand("rename", "✏️ Rename a wallet"),
+            BotCommand("balance", "💰 Check wallet balance"),
+            BotCommand("recent", "📜 Show recent transactions"),
+            BotCommand("stats", "📊 Show your statistics"),
+            BotCommand("help", "❓ Show help message"),
+        ]
+        await app.bot.set_my_commands(commands)
+        
         asyncio.create_task(monitor_wallets(app))
     
     application.post_init = post_init
