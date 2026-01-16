@@ -2,17 +2,15 @@ import os
 import asyncio
 import aiohttp
 from datetime import datetime
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 import json
 
 # ============ CONFIGURATION ============
-# Get these from environment variables (you'll set these in your hosting platform)
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', 'YOUR_BOT_TOKEN_HERE')
 SOLANA_RPC_URL = os.environ.get('SOLANA_RPC_URL', 'https://api.mainnet-beta.solana.com')
 
-# Store tracked wallets in memory (in production, use a database)
-# Format: {user_id: {'wallets': [addresses], 'last_signatures': {address: signature}}}
+# Store tracked wallets in memory
 user_data = {}
 
 # ============ SOLANA BLOCKCHAIN FUNCTIONS ============
@@ -31,7 +29,6 @@ async def get_wallet_balance(address: str) -> dict:
             async with session.post(SOLANA_RPC_URL, json=payload) as response:
                 data = await response.json()
                 if 'result' in data:
-                    # Convert lamports to SOL (1 SOL = 1,000,000,000 lamports)
                     sol_balance = data['result']['value'] / 1_000_000_000
                     return {'success': True, 'balance': sol_balance}
                 else:
@@ -56,29 +53,6 @@ async def get_recent_transactions(address: str, limit: int = 5) -> dict:
                     return {'success': True, 'transactions': data['result']}
                 else:
                     return {'success': False, 'error': 'Invalid response'}
-        except Exception as e:
-            return {'success': False, 'error': str(e)}
-
-async def get_transaction_details(signature: str) -> dict:
-    """Get detailed information about a specific transaction"""
-    async with aiohttp.ClientSession() as session:
-        payload = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "getTransaction",
-            "params": [
-                signature,
-                {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}
-            ]
-        }
-        
-        try:
-            async with session.post(SOLANA_RPC_URL, json=payload) as response:
-                data = await response.json()
-                if 'result' in data and data['result']:
-                    return {'success': True, 'transaction': data['result']}
-                else:
-                    return {'success': False, 'error': 'Transaction not found'}
         except Exception as e:
             return {'success': False, 'error': str(e)}
 
@@ -118,21 +92,17 @@ async def add_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     wallet_address = context.args[0].strip()
     
-    # Validate address length (Solana addresses are typically 32-44 characters)
     if len(wallet_address) < 32 or len(wallet_address) > 44:
         await update.message.reply_text("❌ Invalid Solana wallet address format.")
         return
     
-    # Initialize user data if not exists
     if user_id not in user_data:
         user_data[user_id] = {'wallets': [], 'last_signatures': {}}
     
-    # Check if wallet already tracked
     if wallet_address in user_data[user_id]['wallets']:
         await update.message.reply_text("⚠️ You're already tracking this wallet!")
         return
     
-    # Verify wallet exists by checking balance
     balance_result = await get_wallet_balance(wallet_address)
     if not balance_result['success']:
         await update.message.reply_text(
@@ -141,10 +111,8 @@ async def add_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    # Add wallet to tracking list
     user_data[user_id]['wallets'].append(wallet_address)
     
-    # Get initial transaction signature to avoid notifying about old transactions
     tx_result = await get_recent_transactions(wallet_address, 1)
     if tx_result['success'] and tx_result['transactions']:
         user_data[user_id]['last_signatures'][wallet_address] = tx_result['transactions'][0]['signature']
@@ -199,7 +167,6 @@ async def list_wallets(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = f"📊 *Your Tracked Wallets ({len(wallets)}):*\n\n"
     
     for i, wallet in enumerate(wallets, 1):
-        short_addr = f"{wallet[:6]}...{wallet[-4:]}"
         message += f"{i}. `{wallet}`\n"
     
     await update.message.reply_text(message, parse_mode='Markdown')
@@ -285,9 +252,8 @@ async def monitor_wallets(application: Application):
     
     while True:
         try:
-            for user_id, data in user_data.items():
+            for user_id, data in list(user_data.items()):
                 for wallet_address in data['wallets']:
-                    # Get latest transaction
                     tx_result = await get_recent_transactions(wallet_address, 1)
                     
                     if not tx_result['success'] or not tx_result['transactions']:
@@ -296,14 +262,11 @@ async def monitor_wallets(application: Application):
                     latest_tx = tx_result['transactions'][0]
                     latest_signature = latest_tx['signature']
                     
-                    # Check if this is a new transaction
                     last_known_signature = data['last_signatures'].get(wallet_address)
                     
                     if last_known_signature and latest_signature != last_known_signature:
-                        # New transaction detected!
                         data['last_signatures'][wallet_address] = latest_signature
                         
-                        # Send notification to user
                         timestamp = datetime.fromtimestamp(latest_tx['blockTime']).strftime('%Y-%m-%d %H:%M:%S')
                         status = "✅ Success" if latest_tx.get('err') is None else "❌ Failed"
                         
@@ -327,10 +290,8 @@ async def monitor_wallets(application: Application):
                             print(f"Error sending notification to user {user_id}: {e}")
                     
                     elif not last_known_signature:
-                        # First time seeing this wallet, just record the signature
                         data['last_signatures'][wallet_address] = latest_signature
             
-            # Wait 15 seconds before next check (adjust as needed)
             await asyncio.sleep(15)
             
         except Exception as e:
@@ -347,7 +308,7 @@ def main():
         print("Get your token from @BotFather on Telegram")
         return
     
-    # Create the Application
+    # Create the Application (without job_queue to avoid Python 3.13 issues)
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     
     # Add command handlers
@@ -359,11 +320,11 @@ def main():
     application.add_handler(CommandHandler("balance", check_balance))
     application.add_handler(CommandHandler("recent", show_recent_transactions))
     
-    # Start the monitoring task
-    application.job_queue.run_once(
-        lambda context: asyncio.create_task(monitor_wallets(application)),
-        when=1
-    )
+    # Start the monitoring task in the background
+    async def post_init(app: Application):
+        asyncio.create_task(monitor_wallets(app))
+    
+    application.post_init = post_init
     
     # Start the bot
     print("🤖 Bot is starting...")
