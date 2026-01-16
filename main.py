@@ -19,9 +19,6 @@ SYSTEM_PROGRAM_ID = "11111111111111111111111111111111"
 # Store tracked wallets in memory
 user_data = {}
 
-# Cache for token metadata to avoid repeated API calls
-token_metadata_cache = {}
-
 # ============ SOLANA BLOCKCHAIN FUNCTIONS ============
 
 async def get_wallet_balance(address: str) -> dict:
@@ -92,80 +89,23 @@ async def get_transaction_details(signature: str) -> dict:
             return {'success': False, 'error': str(e)}
 
 async def get_token_metadata(mint_address: str) -> dict:
-    """Get token metadata (name, symbol, decimals) with multiple fallbacks"""
-    
-    # Check cache first
-    if mint_address in token_metadata_cache:
-        return token_metadata_cache[mint_address]
-    
-    # Handle native SOL
-    if mint_address == 'So11111111111111111111111111111111111111112':
-        result = {
-            'success': True,
-            'symbol': 'SOL',
-            'name': 'Solana',
-            'decimals': 9
-        }
-        token_metadata_cache[mint_address] = result
-        return result
-    
+    """Get token metadata (name, symbol, decimals)"""
     async with aiohttp.ClientSession() as session:
-        # Method 1: Try Jupiter strict list first
+        # Try to get token metadata from Jupiter API
         try:
-            async with session.get('https://token.jup.ag/strict', timeout=aiohttp.ClientTimeout(total=5)) as response:
-                if response.status == 200:
-                    tokens = await response.json()
-                    for token in tokens:
-                        if token.get('address') == mint_address:
-                            result = {
-                                'success': True,
-                                'symbol': token.get('symbol', 'UNKNOWN'),
-                                'name': token.get('name', 'Unknown Token'),
-                                'decimals': token.get('decimals', 9)
-                            }
-                            token_metadata_cache[mint_address] = result
-                            return result
-        except Exception as e:
-            print(f"Jupiter strict list failed: {e}")
-        
-        # Method 2: Try Jupiter all tokens list
-        try:
-            async with session.get('https://token.jup.ag/all', timeout=aiohttp.ClientTimeout(total=5)) as response:
-                if response.status == 200:
-                    tokens = await response.json()
-                    for token in tokens:
-                        if token.get('address') == mint_address:
-                            result = {
-                                'success': True,
-                                'symbol': token.get('symbol', 'UNKNOWN'),
-                                'name': token.get('name', 'Unknown Token'),
-                                'decimals': token.get('decimals', 9)
-                            }
-                            token_metadata_cache[mint_address] = result
-                            return result
-        except Exception as e:
-            print(f"Jupiter all tokens failed: {e}")
-        
-        # Method 3: Try Solscan API
-        try:
-            async with session.get(
-                f'https://public-api.solscan.io/token/meta?tokenAddress={mint_address}',
-                timeout=aiohttp.ClientTimeout(total=5)
-            ) as response:
+            async with session.get(f"https://tokens.jup.ag/token/{mint_address}") as response:
                 if response.status == 200:
                     data = await response.json()
-                    result = {
+                    return {
                         'success': True,
                         'symbol': data.get('symbol', 'UNKNOWN'),
                         'name': data.get('name', 'Unknown Token'),
                         'decimals': data.get('decimals', 9)
                     }
-                    token_metadata_cache[mint_address] = result
-                    return result
-        except Exception as e:
-            print(f"Solscan API failed: {e}")
+        except:
+            pass
         
-        # Method 4: Get decimals from Solana RPC (last resort)
+        # Fallback: get decimals from Solana RPC
         payload = {
             "jsonrpc": "2.0",
             "id": 1,
@@ -177,31 +117,26 @@ async def get_token_metadata(mint_address: str) -> dict:
         }
         
         try:
-            async with session.post(SOLANA_RPC_URL, json=payload, timeout=aiohttp.ClientTimeout(total=5)) as response:
+            async with session.post(SOLANA_RPC_URL, json=payload) as response:
                 data = await response.json()
                 if 'result' in data and data['result'] and data['result']['value']:
                     parsed = data['result']['value']['data']['parsed']
                     decimals = parsed['info']['decimals']
-                    result = {
+                    return {
                         'success': True,
                         'symbol': f"{mint_address[:4]}...{mint_address[-4:]}",
                         'name': 'Unknown Token',
                         'decimals': decimals
                     }
-                    token_metadata_cache[mint_address] = result
-                    return result
-        except Exception as e:
-            print(f"Solana RPC failed: {e}")
+        except:
+            pass
         
-        # Complete fallback
-        result = {
+        return {
             'success': False,
-            'symbol': f"{mint_address[:4]}...{mint_address[-4:]}",
+            'symbol': 'UNKNOWN',
             'name': 'Unknown Token',
             'decimals': 9
         }
-        token_metadata_cache[mint_address] = result
-        return result
 
 def parse_token_transfers(tx_data: dict, wallet_address: str) -> List[Dict]:
     """Parse transaction to find token transfers (buys/sells)"""
@@ -584,330 +519,7 @@ async def show_recent_transactions(update: Update, context: ContextTypes.DEFAULT
                     else:
                         # Get token metadata
                         token_info = await get_token_metadata(transfer['mint'])
-                        symbol = token_info.get('symbol', 'UNKNOWN')
-                        # Add $ prefix if not already present
-                        if not symbol.startswith('
-        
-        message += f"   🔗 [View on Solscan](https://solscan.io/tx/{signature})\n\n"
-    
-    await update.message.reply_text(message, parse_mode='Markdown', disable_web_page_preview=True)
-
-# ============ BACKGROUND MONITORING ============
-
-async def monitor_wallets(application: Application):
-    """Background task to monitor all tracked wallets for new transactions"""
-    print("🔍 Wallet monitoring started with token detection...")
-    
-    while True:
-        try:
-            for user_id, data in list(user_data.items()):
-                for wallet_address, wallet_name in data['wallets'].items():
-                    tx_result = await get_recent_transactions(wallet_address, 1)
-                    
-                    if not tx_result['success'] or not tx_result['transactions']:
-                        continue
-                    
-                    latest_tx = tx_result['transactions'][0]
-                    latest_signature = latest_tx['signature']
-                    
-                    last_known_signature = data['last_signatures'].get(wallet_address)
-                    
-                    if last_known_signature and latest_signature != last_known_signature:
-                        data['last_signatures'][wallet_address] = latest_signature
-                        
-                        timestamp = datetime.fromtimestamp(latest_tx['blockTime']).strftime('%Y-%m-%d %H:%M:%S')
-                        status = "✅ Success" if latest_tx.get('err') is None else "❌ Failed"
-                        
-                        notification = (
-                            f"🔔 *New Transaction Detected!*\n\n"
-                            f"📛 Wallet: *{wallet_name}*\n"
-                            f"📍 Address: `{wallet_address[:8]}...{wallet_address[-8:]}`\n"
-                            f"Status: {status}\n"
-                            f"Time: {timestamp}\n\n"
-                        )
-                        
-                        # Get transaction details
-                        tx_details = await get_transaction_details(latest_signature)
-                        if tx_details['success']:
-                            transfers = parse_token_transfers(tx_details['transaction'], wallet_address)
-                            
-                            if transfers:
-                                notification += "*Transaction Details:*\n"
-                                for transfer in transfers:
-                                    if transfer.get('is_sol'):
-                                        emoji = "📥" if transfer['type'] == 'RECEIVE' else "📤"
-                                        notification += f"{emoji} {transfer['type']}: *{transfer['amount']:.4f} SOL*\n"
-                                    else:
-                                        token_info = await get_token_metadata(transfer['mint'])
-                                        symbol = token_info.get('symbol', 'UNKNOWN')
-                                        # Add $ prefix if not already present
-                                        if not symbol.startswith('
-                                notification += "\n"
-                        
-                        notification += f"🔗 [View on Solscan](https://solscan.io/tx/{latest_signature})"
-                        
-                        try:
-                            await application.bot.send_message(
-                                chat_id=user_id,
-                                text=notification,
-                                parse_mode='Markdown',
-                                disable_web_page_preview=True
-                            )
-                        except Exception as e:
-                            print(f"Error sending notification to user {user_id}: {e}")
-                    
-                    elif not last_known_signature:
-                        data['last_signatures'][wallet_address] = latest_signature
-            
-            await asyncio.sleep(15)
-            
-        except Exception as e:
-            print(f"Error in monitoring loop: {e}")
-            await asyncio.sleep(30)
-
-# ============ MAIN FUNCTION ============
-
-def main():
-    """Start the bot"""
-    
-    if TELEGRAM_BOT_TOKEN == 'YOUR_BOT_TOKEN_HERE':
-        print("❌ ERROR: Please set your TELEGRAM_BOT_TOKEN!")
-        print("Get your token from @BotFather on Telegram")
-        return
-    
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("add", add_wallet))
-    application.add_handler(CommandHandler("rename", rename_wallet))
-    application.add_handler(CommandHandler("remove", remove_wallet))
-    application.add_handler(CommandHandler("list", list_wallets))
-    application.add_handler(CommandHandler("balance", check_balance))
-    application.add_handler(CommandHandler("recent", show_recent_transactions))
-    application.add_handler(CommandHandler("stats", stats_command))
-    
-    async def post_init(app: Application):
-        commands = [
-            BotCommand("start", "🏠 Start the bot"),
-            BotCommand("add", "➕ Add wallet to track"),
-            BotCommand("remove", "➖ Remove wallet"),
-            BotCommand("list", "📋 Show tracked wallets"),
-            BotCommand("rename", "✏️ Rename wallet"),
-            BotCommand("balance", "💰 Check balance"),
-            BotCommand("recent", "📜 Recent transactions with tokens"),
-            BotCommand("stats", "📊 Your statistics"),
-            BotCommand("help", "❓ Help message"),
-        ]
-        await app.bot.set_my_commands(commands)
-        asyncio.create_task(monitor_wallets(app))
-    
-    application.post_init = post_init
-    
-    print("🤖 Bot starting with token buy/sell detection...")
-    print("Press Ctrl+C to stop")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
-
-if __name__ == '__main__':
-    main()) and symbol != 'UNKNOWN':
-                            symbol = f"${symbol}"
-                        emoji = "🟢" if transfer['type'] == 'BUY' else "🔴"
-                        message += f"   {emoji} {transfer['type']}: *{transfer['amount']:.4f} {symbol}*\n"
-        
-        message += f"   🔗 [View on Solscan](https://solscan.io/tx/{signature})\n\n"
-    
-    await update.message.reply_text(message, parse_mode='Markdown', disable_web_page_preview=True)
-
-# ============ BACKGROUND MONITORING ============
-
-async def monitor_wallets(application: Application):
-    """Background task to monitor all tracked wallets for new transactions"""
-    print("🔍 Wallet monitoring started with token detection...")
-    
-    while True:
-        try:
-            for user_id, data in list(user_data.items()):
-                for wallet_address, wallet_name in data['wallets'].items():
-                    tx_result = await get_recent_transactions(wallet_address, 1)
-                    
-                    if not tx_result['success'] or not tx_result['transactions']:
-                        continue
-                    
-                    latest_tx = tx_result['transactions'][0]
-                    latest_signature = latest_tx['signature']
-                    
-                    last_known_signature = data['last_signatures'].get(wallet_address)
-                    
-                    if last_known_signature and latest_signature != last_known_signature:
-                        data['last_signatures'][wallet_address] = latest_signature
-                        
-                        timestamp = datetime.fromtimestamp(latest_tx['blockTime']).strftime('%Y-%m-%d %H:%M:%S')
-                        status = "✅ Success" if latest_tx.get('err') is None else "❌ Failed"
-                        
-                        notification = (
-                            f"🔔 *New Transaction Detected!*\n\n"
-                            f"📛 Wallet: *{wallet_name}*\n"
-                            f"📍 Address: `{wallet_address[:8]}...{wallet_address[-8:]}`\n"
-                            f"Status: {status}\n"
-                            f"Time: {timestamp}\n\n"
-                        )
-                        
-                        # Get transaction details
-                        tx_details = await get_transaction_details(latest_signature)
-                        if tx_details['success']:
-                            transfers = parse_token_transfers(tx_details['transaction'], wallet_address)
-                            
-                            if transfers:
-                                notification += "*Transaction Details:*\n"
-                                for transfer in transfers:
-                                    if transfer.get('is_sol'):
-                                        emoji = "📥" if transfer['type'] == 'RECEIVE' else "📤"
-                                        notification += f"{emoji} {transfer['type']}: *{transfer['amount']:.4f} SOL*\n"
-                                    else:
-                                        token_info = await get_token_metadata(transfer['mint'])
-                                        symbol = token_info['symbol'] if token_info['success'] else 'UNKNOWN'
-                                        emoji = "🟢" if transfer['type'] == 'BUY' else "🔴"
-                                        notification += f"{emoji} {transfer['type']}: *{transfer['amount']:.4f} {symbol}*\n"
-                                notification += "\n"
-                        
-                        notification += f"🔗 [View on Solscan](https://solscan.io/tx/{latest_signature})"
-                        
-                        try:
-                            await application.bot.send_message(
-                                chat_id=user_id,
-                                text=notification,
-                                parse_mode='Markdown',
-                                disable_web_page_preview=True
-                            )
-                        except Exception as e:
-                            print(f"Error sending notification to user {user_id}: {e}")
-                    
-                    elif not last_known_signature:
-                        data['last_signatures'][wallet_address] = latest_signature
-            
-            await asyncio.sleep(15)
-            
-        except Exception as e:
-            print(f"Error in monitoring loop: {e}")
-            await asyncio.sleep(30)
-
-# ============ MAIN FUNCTION ============
-
-def main():
-    """Start the bot"""
-    
-    if TELEGRAM_BOT_TOKEN == 'YOUR_BOT_TOKEN_HERE':
-        print("❌ ERROR: Please set your TELEGRAM_BOT_TOKEN!")
-        print("Get your token from @BotFather on Telegram")
-        return
-    
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("add", add_wallet))
-    application.add_handler(CommandHandler("rename", rename_wallet))
-    application.add_handler(CommandHandler("remove", remove_wallet))
-    application.add_handler(CommandHandler("list", list_wallets))
-    application.add_handler(CommandHandler("balance", check_balance))
-    application.add_handler(CommandHandler("recent", show_recent_transactions))
-    application.add_handler(CommandHandler("stats", stats_command))
-    
-    async def post_init(app: Application):
-        commands = [
-            BotCommand("start", "🏠 Start the bot"),
-            BotCommand("add", "➕ Add wallet to track"),
-            BotCommand("remove", "➖ Remove wallet"),
-            BotCommand("list", "📋 Show tracked wallets"),
-            BotCommand("rename", "✏️ Rename wallet"),
-            BotCommand("balance", "💰 Check balance"),
-            BotCommand("recent", "📜 Recent transactions with tokens"),
-            BotCommand("stats", "📊 Your statistics"),
-            BotCommand("help", "❓ Help message"),
-        ]
-        await app.bot.set_my_commands(commands)
-        asyncio.create_task(monitor_wallets(app))
-    
-    application.post_init = post_init
-    
-    print("🤖 Bot starting with token buy/sell detection...")
-    print("Press Ctrl+C to stop")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
-
-if __name__ == '__main__':
-    main()) and symbol != 'UNKNOWN':
-                                            symbol = f"${symbol}"
-                                        emoji = "🟢" if transfer['type'] == 'BUY' else "🔴"
-                                        notification += f"{emoji} {transfer['type']}: *{transfer['amount']:.4f} {symbol}*\n"
-                                notification += "\n"
-                        
-                        notification += f"🔗 [View on Solscan](https://solscan.io/tx/{latest_signature})"
-                        
-                        try:
-                            await application.bot.send_message(
-                                chat_id=user_id,
-                                text=notification,
-                                parse_mode='Markdown',
-                                disable_web_page_preview=True
-                            )
-                        except Exception as e:
-                            print(f"Error sending notification to user {user_id}: {e}")
-                    
-                    elif not last_known_signature:
-                        data['last_signatures'][wallet_address] = latest_signature
-            
-            await asyncio.sleep(15)
-            
-        except Exception as e:
-            print(f"Error in monitoring loop: {e}")
-            await asyncio.sleep(30)
-
-# ============ MAIN FUNCTION ============
-
-def main():
-    """Start the bot"""
-    
-    if TELEGRAM_BOT_TOKEN == 'YOUR_BOT_TOKEN_HERE':
-        print("❌ ERROR: Please set your TELEGRAM_BOT_TOKEN!")
-        print("Get your token from @BotFather on Telegram")
-        return
-    
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("add", add_wallet))
-    application.add_handler(CommandHandler("rename", rename_wallet))
-    application.add_handler(CommandHandler("remove", remove_wallet))
-    application.add_handler(CommandHandler("list", list_wallets))
-    application.add_handler(CommandHandler("balance", check_balance))
-    application.add_handler(CommandHandler("recent", show_recent_transactions))
-    application.add_handler(CommandHandler("stats", stats_command))
-    
-    async def post_init(app: Application):
-        commands = [
-            BotCommand("start", "🏠 Start the bot"),
-            BotCommand("add", "➕ Add wallet to track"),
-            BotCommand("remove", "➖ Remove wallet"),
-            BotCommand("list", "📋 Show tracked wallets"),
-            BotCommand("rename", "✏️ Rename wallet"),
-            BotCommand("balance", "💰 Check balance"),
-            BotCommand("recent", "📜 Recent transactions with tokens"),
-            BotCommand("stats", "📊 Your statistics"),
-            BotCommand("help", "❓ Help message"),
-        ]
-        await app.bot.set_my_commands(commands)
-        asyncio.create_task(monitor_wallets(app))
-    
-    application.post_init = post_init
-    
-    print("🤖 Bot starting with token buy/sell detection...")
-    print("Press Ctrl+C to stop")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
-
-if __name__ == '__main__':
-    main()) and symbol != 'UNKNOWN':
-                            symbol = f"${symbol}"
+                        symbol = token_info['symbol'] if token_info['success'] else 'UNKNOWN'
                         emoji = "🟢" if transfer['type'] == 'BUY' else "🔴"
                         message += f"   {emoji} {transfer['type']}: *{transfer['amount']:.4f} {symbol}*\n"
         
