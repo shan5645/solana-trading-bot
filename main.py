@@ -1,6 +1,7 @@
 import os
 import asyncio
 import aiohttp
+import json
 from datetime import datetime
 from telegram import Update, BotCommand
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -17,11 +18,43 @@ logger = logging.getLogger(__name__)
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', 'YOUR_BOT_TOKEN_HERE')
 SOLANA_RPC_URL = os.environ.get('SOLANA_RPC_URL', 'https://api.mainnet-beta.solana.com')
 
+# File to store user data persistently
+DATA_FILE = 'wallet_data.json'
+
 # Store tracked wallets in memory
 user_data = {}
 
 # Cache for token metadata
 token_metadata_cache = {}
+
+# ============ DATA PERSISTENCE ============
+
+def save_data():
+    """Save user data to file"""
+    try:
+        with open(DATA_FILE, 'w') as f:
+            json.dump(user_data, f, indent=2)
+        logger.info("💾 Data saved successfully")
+    except Exception as e:
+        logger.error(f"Error saving data: {e}")
+
+def load_data():
+    """Load user data from file"""
+    global user_data
+    try:
+        if os.path.exists(DATA_FILE):
+            with open(DATA_FILE, 'r') as f:
+                user_data = json.load(f)
+            logger.info(f"📂 Loaded data for {len(user_data)} users")
+            
+            # Count total wallets
+            total_wallets = sum(len(data.get('wallets', {})) for data in user_data.values())
+            logger.info(f"📊 Total tracked wallets: {total_wallets}")
+        else:
+            logger.info("📂 No saved data found, starting fresh")
+    except Exception as e:
+        logger.error(f"Error loading data: {e}")
+        user_data = {}
 
 # ============ SOLANA FUNCTIONS ============
 
@@ -253,6 +286,8 @@ async def add_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if tx_result['success'] and tx_result['transactions']:
             user_data[user_id]['last_signatures'][wallet_address] = tx_result['transactions'][0]['signature']
         
+        save_data()  # Save after adding wallet
+        
         await update.message.reply_text(
             f"✅ Now tracking:\n📛 *{wallet_name}*\n💰 Balance: *{balance_result['balance']:.4f} SOL*",
             parse_mode='Markdown'
@@ -281,6 +316,8 @@ async def remove_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         if wallet_address in user_data[user_id]['last_signatures']:
             del user_data[user_id]['last_signatures'][wallet_address]
+        
+        save_data()  # Save after removing wallet
         
         await update.message.reply_text(f"✅ Stopped tracking: *{wallet_name}*", parse_mode='Markdown')
         logger.info(f"User {user_id} removed {wallet_name}")
@@ -441,36 +478,30 @@ async def monitor_wallets(application: Application):
                             timestamp = datetime.fromtimestamp(latest_tx['blockTime']).strftime('%Y-%m-%d %H:%M')
                             status = "✅" if latest_tx.get('err') is None else "❌"
                             
-                            notification = (
-                                f"🔔 *New Transaction!*\n\n"
-                                f"📛 *{wallet_name}*\n"
-                                f"Status: {status}\n"
-                                f"Time: {timestamp}\n"
-                                f"Sig: `{latest_sig[:16]}...`\n\n"
-                            )
-                            
+                            # Get transaction details FIRST
                             tx_details = await get_transaction_details(latest_sig)
+                            transfers = []
+                            
                             if tx_details['success']:
                                 transfers = parse_token_transfers(tx_details['transaction'], wallet_address)
-                                
-                                if transfers:
-                                    notification += "*Movements:*\n"
-                                    for transfer in transfers:
-                                        if transfer.get('is_sol'):
-                                            emoji = "📥" if transfer['type'] == 'RECEIVE' else "📤"
-                                            notification += f"{emoji} {transfer['type']}: *{transfer['amount']:.4f} SOL*\n"
-                                        else:
-                                            token_info = await get_token_metadata(transfer['mint'])
-                                            symbol = token_info.get('symbol', 'UNKNOWN')
-                                            
-                                            if token_info.get('success') and not symbol.startswith('$'):
-                                                symbol = '$' + symbol
-                                            
-                                            emoji = "🟢" if transfer['type'] == 'BUY' else "🔴"
-                                            notification += f"{emoji} {transfer['type']}: *{transfer['amount']:.4f} {symbol}*\n"
-                                    notification += "\n"
                             
-                            notification += f"🔗 [View](https://solscan.io/tx/{latest_sig})"
+                            # Build notification - TOKEN INFO FIRST (most important!)
+                            notification = f"🔔 *New Transaction!*\n\n"
+                            
+                            # Show token movements PROMINENTLY at the top
+                            if transfers:
+                                for transfer in transfers:
+                                    if transfer.get('is_sol'):
+                                        emoji = "📥" if transfer['type'] == 'RECEIVE' else "📤"
+                                        notification += f"{emoji} *{transfer['type']} {transfer['amount']:.4f} SOL*\n"
+                                    else:
+                                        # Get token symbol
+                                        token_info = await get_token_metadata(transfer['mint'])
+                                        symbol = token_info.get('symbol', 'UNKNOWN')
+                                        
+                                        # Add $ prefix if we found the real token
+                                        if token_info.get('success') and not symbol.startswith('
+                
                             
                             try:
                                 await application.bot.send_message(
@@ -500,6 +531,184 @@ async def monitor_wallets(application: Application):
 
 async def post_init(application: Application):
     logger.info("🤖 Bot initialized!")
+    
+    # Load saved data at startup
+    load_data()
+    
+    commands = [
+        BotCommand("start", "Start the bot"),
+        BotCommand("add", "Add wallet to track"),
+        BotCommand("remove", "Remove wallet"),
+        BotCommand("list", "List tracked wallets"),
+        BotCommand("balance", "Check wallet balance"),
+        BotCommand("recent", "Show recent transactions"),
+        BotCommand("stats", "Show statistics"),
+    ]
+    
+    try:
+        await application.bot.set_my_commands(commands)
+        logger.info("✅ Commands set")
+    except Exception as e:
+        logger.error(f"Error setting commands: {e}")
+    
+    asyncio.create_task(monitor_wallets(application))
+
+def main():
+    if TELEGRAM_BOT_TOKEN == 'YOUR_BOT_TOKEN_HERE':
+        logger.error("❌ Set TELEGRAM_BOT_TOKEN environment variable!")
+        return
+    
+    logger.info("🚀 Starting bot...")
+    
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("add", add_wallet))
+    application.add_handler(CommandHandler("remove", remove_wallet))
+    application.add_handler(CommandHandler("list", list_wallets))
+    application.add_handler(CommandHandler("balance", check_balance))
+    application.add_handler(CommandHandler("recent", show_recent_transactions))
+    application.add_handler(CommandHandler("stats", stats_command))
+    
+    application.post_init = post_init
+    
+    logger.info("🤖 Bot starting...")
+    
+    try:
+        application.run_polling(allowed_updates=Update.ALL_TYPES)
+    except KeyboardInterrupt:
+        logger.info("🛑 Stopped by user")
+    except Exception as e:
+        logger.error(f"❌ Fatal error: {e}")
+
+if __name__ == '__main__':
+    main()):
+                                            symbol = '
+                
+                            
+                            try:
+                                await application.bot.send_message(
+                                    chat_id=user_id,
+                                    text=notification,
+                                    parse_mode='Markdown',
+                                    disable_web_page_preview=True
+                                )
+                                logger.info(f"Notification sent to {user_id} for {wallet_name}")
+                            except Exception as e:
+                                logger.error(f"Error sending notification: {e}")
+                        
+                        elif not last_known:
+                            data['last_signatures'][wallet_address] = latest_sig
+                    
+                    except Exception as e:
+                        logger.error(f"Error monitoring {wallet_address}: {e}")
+                        continue
+            
+            await asyncio.sleep(15)
+            
+        except Exception as e:
+            logger.error(f"Error in monitoring loop: {e}")
+            await asyncio.sleep(30)
+
+# ============ MAIN ============
+
+async def post_init(application: Application):
+    logger.info("🤖 Bot initialized!")
+    
+    # Load saved data at startup
+    load_data()
+    
+    commands = [
+        BotCommand("start", "Start the bot"),
+        BotCommand("add", "Add wallet to track"),
+        BotCommand("remove", "Remove wallet"),
+        BotCommand("list", "List tracked wallets"),
+        BotCommand("balance", "Check wallet balance"),
+        BotCommand("recent", "Show recent transactions"),
+        BotCommand("stats", "Show statistics"),
+    ]
+    
+    try:
+        await application.bot.set_my_commands(commands)
+        logger.info("✅ Commands set")
+    except Exception as e:
+        logger.error(f"Error setting commands: {e}")
+    
+    asyncio.create_task(monitor_wallets(application))
+
+def main():
+    if TELEGRAM_BOT_TOKEN == 'YOUR_BOT_TOKEN_HERE':
+        logger.error("❌ Set TELEGRAM_BOT_TOKEN environment variable!")
+        return
+    
+    logger.info("🚀 Starting bot...")
+    
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("add", add_wallet))
+    application.add_handler(CommandHandler("remove", remove_wallet))
+    application.add_handler(CommandHandler("list", list_wallets))
+    application.add_handler(CommandHandler("balance", check_balance))
+    application.add_handler(CommandHandler("recent", show_recent_transactions))
+    application.add_handler(CommandHandler("stats", stats_command))
+    
+    application.post_init = post_init
+    
+    logger.info("🤖 Bot starting...")
+    
+    try:
+        application.run_polling(allowed_updates=Update.ALL_TYPES)
+    except KeyboardInterrupt:
+        logger.info("🛑 Stopped by user")
+    except Exception as e:
+        logger.error(f"❌ Fatal error: {e}")
+
+if __name__ == '__main__':
+    main() + symbol
+                                        
+                                        emoji = "🟢" if transfer['type'] == 'BUY' else "🔴"
+                                        notification += f"{emoji} *{transfer['type']} {transfer['amount']:.4f} {symbol}*\n"
+                                notification += "\n"
+                            
+                            # Then add wallet name and details
+                            notification += f"📛 *{wallet_name}*\n"
+                            notification += f"Status: {status}\n"
+                            notification += f"Time: {timestamp}\n"
+                            notification += f"🔗 [View Transaction](https://solscan.io/tx/{latest_sig})"
+                
+                            
+                            try:
+                                await application.bot.send_message(
+                                    chat_id=user_id,
+                                    text=notification,
+                                    parse_mode='Markdown',
+                                    disable_web_page_preview=True
+                                )
+                                logger.info(f"Notification sent to {user_id} for {wallet_name}")
+                            except Exception as e:
+                                logger.error(f"Error sending notification: {e}")
+                        
+                        elif not last_known:
+                            data['last_signatures'][wallet_address] = latest_sig
+                    
+                    except Exception as e:
+                        logger.error(f"Error monitoring {wallet_address}: {e}")
+                        continue
+            
+            await asyncio.sleep(15)
+            
+        except Exception as e:
+            logger.error(f"Error in monitoring loop: {e}")
+            await asyncio.sleep(30)
+
+# ============ MAIN ============
+
+async def post_init(application: Application):
+    logger.info("🤖 Bot initialized!")
+    
+    # Load saved data at startup
+    load_data()
     
     commands = [
         BotCommand("start", "Start the bot"),
