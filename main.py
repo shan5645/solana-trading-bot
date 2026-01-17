@@ -117,7 +117,111 @@ async def get_token_metadata(mint_address: str) -> dict:
     
     try:
         async with aiohttp.ClientSession() as session:
-            # Method 1: Try Jupiter strict list first
+            # Method 1: Try Solscan API (best for all Solana tokens - has everything!)
+            try:
+                headers = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                }
+                async with session.get(
+                    f'https://pro-api.solscan.io/v1.0/token/meta?tokenAddress={mint_address}',
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=5)
+                ) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        if data.get('symbol'):
+                            result = {
+                                'success': True,
+                                'symbol': data.get('symbol', 'UNKNOWN'),
+                                'name': data.get('name', 'Unknown Token'),
+                                'decimals': data.get('decimals', 9)
+                            }
+                            token_metadata_cache[mint_address] = result
+                            logger.info(f"Found token via Solscan: {result['symbol']}")
+                            return result
+            except Exception as e:
+                logger.debug(f"Solscan API failed: {e}")
+            
+            # Method 2: Try Helius RPC (has token metadata built-in)
+            try:
+                payload = {
+                    "jsonrpc": "2.0",
+                    "id": "1",
+                    "method": "getAsset",
+                    "params": {
+                        "id": mint_address
+                    }
+                }
+                async with session.post(
+                    'https://mainnet.helius-rpc.com/?api-key=public',
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=5)
+                ) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        if data.get('result') and data['result'].get('content'):
+                            content = data['result']['content']
+                            metadata = content.get('metadata', {})
+                            if metadata.get('symbol'):
+                                result = {
+                                    'success': True,
+                                    'symbol': metadata.get('symbol', 'UNKNOWN'),
+                                    'name': metadata.get('name', 'Unknown Token'),
+                                    'decimals': content.get('decimals', 9)
+                                }
+                                token_metadata_cache[mint_address] = result
+                                logger.info(f"Found token via Helius: {result['symbol']}")
+                                return result
+            except Exception as e:
+                logger.debug(f"Helius API failed: {e}")
+            
+            # Method 3: Try SolanaFM API
+            try:
+                async with session.get(
+                    f'https://api.solana.fm/v0/tokens/{mint_address}',
+                    timeout=aiohttp.ClientTimeout(total=5)
+                ) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        if data.get('tokenInfo'):
+                            token_info = data['tokenInfo']
+                            result = {
+                                'success': True,
+                                'symbol': token_info.get('symbol', 'UNKNOWN'),
+                                'name': token_info.get('name', 'Unknown Token'),
+                                'decimals': token_info.get('decimals', 9)
+                            }
+                            token_metadata_cache[mint_address] = result
+                            logger.info(f"Found token via SolanaFM: {result['symbol']}")
+                            return result
+            except Exception as e:
+                logger.debug(f"SolanaFM API failed: {e}")
+            
+            # Method 4: Try DexScreener API (best for new/meme tokens)
+            try:
+                async with session.get(
+                    f'https://api.dexscreener.com/latest/dex/tokens/{mint_address}',
+                    timeout=aiohttp.ClientTimeout(total=5)
+                ) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        if data.get('pairs') and len(data['pairs']) > 0:
+                            pair = data['pairs'][0]
+                            base_token = pair.get('baseToken', {})
+                            if base_token.get('address') == mint_address:
+                                result = {
+                                    'success': True,
+                                    'symbol': base_token.get('symbol', 'UNKNOWN'),
+                                    'name': base_token.get('name', 'Unknown Token'),
+                                    'decimals': 9
+                                }
+                                token_metadata_cache[mint_address] = result
+                                logger.info(f"Found token via DexScreener: {result['symbol']}")
+                                return result
+            except Exception as e:
+                logger.debug(f"DexScreener API failed: {e}")
+            
+            # Method 5: Try Jupiter strict list
             try:
                 async with session.get('https://token.jup.ag/strict', timeout=aiohttp.ClientTimeout(total=5)) as response:
                     if response.status == 200:
@@ -131,59 +235,76 @@ async def get_token_metadata(mint_address: str) -> dict:
                                     'decimals': token.get('decimals', 9)
                                 }
                                 token_metadata_cache[mint_address] = result
+                                logger.info(f"Found token via Jupiter: {result['symbol']}")
                                 return result
             except Exception as e:
                 logger.debug(f"Jupiter strict list failed: {e}")
             
-            # Method 2: Try Jupiter all tokens list
+            # Method 6: Try reading token metadata from Metaplex (onchain data)
             try:
-                async with session.get('https://token.jup.ag/all', timeout=aiohttp.ClientTimeout(total=5)) as response:
-                    if response.status == 200:
-                        tokens = await response.json()
-                        for token in tokens:
-                            if token.get('address') == mint_address:
-                                result = {
-                                    'success': True,
-                                    'symbol': token.get('symbol', 'UNKNOWN'),
-                                    'name': token.get('name', 'Unknown Token'),
-                                    'decimals': token.get('decimals', 9)
-                                }
-                                token_metadata_cache[mint_address] = result
-                                return result
-            except Exception as e:
-                logger.debug(f"Jupiter all tokens failed: {e}")
-            
-            # Method 3: Get decimals from Solana RPC (last resort)
-            payload = {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "getAccountInfo",
-                "params": [
-                    mint_address,
-                    {"encoding": "jsonParsed"}
-                ]
-            }
-            
-            try:
+                # Get the metadata account address (PDA)
+                metadata_program = "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s"
+                
+                payload = {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "getAccountInfo",
+                    "params": [
+                        mint_address,
+                        {"encoding": "jsonParsed"}
+                    ]
+                }
+                
                 async with session.post(SOLANA_RPC_URL, json=payload, timeout=aiohttp.ClientTimeout(total=5)) as response:
                     data = await response.json()
                     if 'result' in data and data['result'] and data['result']['value']:
-                        parsed = data['result']['value']['data']['parsed']
-                        decimals = parsed['info']['decimals']
-                        result = {
-                            'success': True,
-                            'symbol': f"{mint_address[:4]}...{mint_address[-4:]}",
-                            'name': 'Unknown Token',
-                            'decimals': decimals
-                        }
-                        token_metadata_cache[mint_address] = result
-                        return result
+                        account_data = data['result']['value']['data']
+                        
+                        # If it's a parsed token account, extract info
+                        if isinstance(account_data, dict) and account_data.get('parsed'):
+                            parsed = account_data['parsed']
+                            decimals = parsed.get('info', {}).get('decimals', 9)
+                            
+                            # Now try to fetch the metadata account
+                            # This is a simplified version - full implementation would derive the PDA
+                            result = {
+                                'success': False,
+                                'symbol': f"{mint_address[:4]}...{mint_address[-4:]}",
+                                'name': 'Unknown Token',
+                                'decimals': decimals
+                            }
+                            token_metadata_cache[mint_address] = result
+                            logger.warning(f"Got decimals from RPC for {mint_address}, but no symbol")
+                            return result
             except Exception as e:
-                logger.debug(f"Solana RPC failed: {e}")
+                logger.debug(f"Metaplex/RPC method failed: {e}")
+            
+            # Method 7: Try Birdeye API
+            try:
+                async with session.get(
+                    f'https://public-api.birdeye.so/public/token_overview?address={mint_address}',
+                    timeout=aiohttp.ClientTimeout(total=5)
+                ) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        if data.get('data'):
+                            token_data = data['data']
+                            result = {
+                                'success': True,
+                                'symbol': token_data.get('symbol', 'UNKNOWN'),
+                                'name': token_data.get('name', 'Unknown Token'),
+                                'decimals': token_data.get('decimals', 9)
+                            }
+                            token_metadata_cache[mint_address] = result
+                            logger.info(f"Found token via Birdeye: {result['symbol']}")
+                            return result
+            except Exception as e:
+                logger.debug(f"Birdeye API failed: {e}")
+                
     except Exception as e:
         logger.error(f"Error in get_token_metadata: {e}")
     
-    # Complete fallback
+    # Complete fallback - use shortened address
     result = {
         'success': False,
         'symbol': f"{mint_address[:4]}...{mint_address[-4:]}",
@@ -191,6 +312,7 @@ async def get_token_metadata(mint_address: str) -> dict:
         'decimals': 9
     }
     token_metadata_cache[mint_address] = result
+    logger.warning(f"All methods failed for {mint_address}, using fallback")
     return result
 
 def parse_token_transfers(tx_data: dict, wallet_address: str) -> List[Dict]:
@@ -607,8 +729,9 @@ async def show_recent_transactions(update: Update, context: ContextTypes.DEFAULT
                             # Get token metadata
                             token_info = await get_token_metadata(transfer['mint'])
                             symbol = token_info.get('symbol', 'UNKNOWN')
-                            emoji = "🟢" if transfer['type'] == 'BUY' else "🔴"
-                            message += f"   {emoji} {transfer['type']}: *{transfer['amount']:.4f} ${symbol}*\n"
+                            
+                            # Only add $ if we successfully found the token (not a fallback address)
+                            if token_info.get('success', False) and not symbol.startswith('
             
             message += f"   🔗 [View on Solscan](https://solscan.io/tx/{signature})\n\n"
         
@@ -683,95 +806,158 @@ async def monitor_wallets(application: Application):
                             
                             try:
                                 await application.bot.send_message(
-                                 chat_id=user_id,
-                                    text=notification,
-                                    parse_mode='Markdown',
-                                    disable_web_page_preview=True
-                                )
-                                logger.info(f"Sent notification to user {user_id} for wallet {wallet_name}")
-                            except Exception as e:
-                                logger.error(f"Error sending notification to user {user_id}: {e}")
-                        
-                        elif not last_known_signature:
-                            # First time seeing this wallet, just record the signature
-                            data['last_signatures'][wallet_address] = latest_signature
+                                    chat):
+                                symbol = '
+            
+            message += f"   🔗 [View on Solscan](https://solscan.io/tx/{signature})\n\n"
+        
+        await update.message.reply_text(message, parse_mode='Markdown', disable_web_page_preview=True)
+    except Exception as e:
+        logger.error(f"Error in show_recent_transactions: {e}")
+        await update.message.reply_text("❌ An error occurred. Please try again.")
+
+# ============ BACKGROUND MONITORING ============
+
+async def monitor_wallets(application: Application):
+    """Background task to monitor all tracked wallets for new transactions"""
+    logger.info("🔍 Wallet monitoring started with token detection...")
+    
+    while True:
+        try:
+            if not user_data:
+                await asyncio.sleep(15)
+                continue
+            
+            for user_id, data in list(user_data.items()):
+                if not data.get('wallets'):
+                    continue
                     
-                    except Exception as e:
-                        logger.error(f"Error monitoring wallet {wallet_address}: {e}")
-                        continue
+                for wallet_address, wallet_name in list(data['wallets'].items()):
+                    try:
+                        tx_result = await get_recent_transactions(wallet_address, 1)
+                        
+                        if not tx_result['success'] or not tx_result['transactions']:
+                            continue
+                        
+                        latest_tx = tx_result['transactions'][0]
+                        latest_signature = latest_tx['signature']
+                        
+                        last_known_signature = data['last_signatures'].get(wallet_address)
+                        
+                        if last_known_signature and latest_signature != last_known_signature:
+                            data['last_signatures'][wallet_address] = latest_signature
+                            
+                            timestamp = datetime.fromtimestamp(latest_tx['blockTime']).strftime('%Y-%m-%d %H:%M:%S')
+                            status = "✅ Success" if latest_tx.get('err') is None else "❌ Failed"
+                            
+                            notification = (
+                                f"🔔 *New Transaction Detected!*\n\n"
+                                f"📛 Wallet: *{wallet_name}*\n"
+                                f"📍 Address: `{wallet_address[:8]}...{wallet_address[-8:]}`\n"
+                                f"Status: {status}\n"
+                                f"Time: {timestamp}\n"
+                                f"Signature: `{latest_signature[:16]}...`\n\n"
+                            )
+                            
+                            # Get transaction details and parse transfers
+                            tx_details = await get_transaction_details(latest_signature)
+                            if tx_details['success']:
+                                transfers = parse_token_transfers(tx_details['transaction'], wallet_address)
+                                
+                                if transfers:
+                                    notification += "*Token Movements:*\n"
+                                    for transfer in transfers:
+                                        if transfer.get('is_sol'):
+                                            emoji = "📥" if transfer['type'] == 'RECEIVE' else "📤"
+                                            notification += f"{emoji} {transfer['type']}: *{transfer['amount']:.4f} SOL*\n"
+                                        else:
+                                            # Get token metadata
+                                            token_info = await get_token_metadata(transfer['mint'])
+                                            symbol = token_info.get('symbol', 'UNKNOWN')
+                                            emoji = "🟢" if transfer['type'] == 'BUY' else "🔴"
+                                            notification += f"{emoji} {transfer['type']}: *{transfer['amount']:.4f} ${symbol}*\n"
+                                    notification += "\n"
+                            
+                            notification += f"🔗 [View on Solscan](https://solscan.io/tx/{latest_signature})"
+                            
+                            try:
+                                await application.bot.send_message(
+                                    chat + symbol
+                            
+                            emoji = "🟢" if transfer['type'] == 'BUY' else "🔴"
+                            message += f"   {emoji} {transfer['type']}: *{transfer['amount']:.4f} {symbol}*\n"
             
-            # Wait 15 seconds before next check
-            await asyncio.sleep(15)
+            message += f"   🔗 [View on Solscan](https://solscan.io/tx/{signature})\n\n"
+        
+        await update.message.reply_text(message, parse_mode='Markdown', disable_web_page_preview=True)
+    except Exception as e:
+        logger.error(f"Error in show_recent_transactions: {e}")
+        await update.message.reply_text("❌ An error occurred. Please try again.")
+
+# ============ BACKGROUND MONITORING ============
+
+async def monitor_wallets(application: Application):
+    """Background task to monitor all tracked wallets for new transactions"""
+    logger.info("🔍 Wallet monitoring started with token detection...")
+    
+    while True:
+        try:
+            if not user_data:
+                await asyncio.sleep(15)
+                continue
             
-        except Exception as e:
-            logger.error(f"Error in monitoring loop: {e}")
-            await asyncio.sleep(30)
-
-# ============ MAIN FUNCTION ============
-
-async def post_init(application: Application):
-    """Initialize the bot after startup"""
-    logger.info("🤖 Bot initialized successfully!")
-    
-    # Set bot commands
-    commands = [
-        BotCommand("start", "Start the bot and see welcome message"),
-        BotCommand("help", "Show help message"),
-        BotCommand("add", "Add a wallet to track"),
-        BotCommand("rename", "Rename a tracked wallet"),
-        BotCommand("remove", "Remove a wallet from tracking"),
-        BotCommand("list", "List all tracked wallets"),
-        BotCommand("balance", "Check wallet balance"),
-        BotCommand("recent", "Show recent transactions"),
-        BotCommand("stats", "Show your statistics"),
-    ]
-    
-    try:
-        await application.bot.set_my_commands(commands)
-        logger.info("✅ Bot commands set successfully")
-    except Exception as e:
-        logger.error(f"Error setting bot commands: {e}")
-    
-    # Start the monitoring task
-    asyncio.create_task(monitor_wallets(application))
-
-def main():
-    """Start the bot"""
-    
-    if TELEGRAM_BOT_TOKEN == 'YOUR_BOT_TOKEN_HERE':
-        logger.error("❌ ERROR: Please set your TELEGRAM_BOT_TOKEN environment variable!")
-        logger.error("Get your token from @BotFather on Telegram")
-        return
-    
-    logger.info("🚀 Starting Solana Wallet Tracker Bot...")
-    
-    # Create the Application
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    
-    # Add command handlers
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("add", add_wallet))
-    application.add_handler(CommandHandler("rename", rename_wallet))
-    application.add_handler(CommandHandler("remove", remove_wallet))
-    application.add_handler(CommandHandler("list", list_wallets))
-    application.add_handler(CommandHandler("balance", check_balance))
-    application.add_handler(CommandHandler("recent", show_recent_transactions))
-    application.add_handler(CommandHandler("stats", stats_command))
-    
-    # Set post_init callback
-    application.post_init = post_init
-    
-    # Start the bot
-    logger.info("🤖 Bot is starting...")
-    logger.info("Press Ctrl+C to stop")
-    
-    try:
-        application.run_polling(allowed_updates=Update.ALL_TYPES)
-    except KeyboardInterrupt:
-        logger.info("🛑 Bot stopped by user")
-    except Exception as e:
-        logger.error(f"❌ Fatal error: {e}")
-
-if __name__ == '__main__':
-    main()
+            for user_id, data in list(user_data.items()):
+                if not data.get('wallets'):
+                    continue
+                    
+                for wallet_address, wallet_name in list(data['wallets'].items()):
+                    try:
+                        tx_result = await get_recent_transactions(wallet_address, 1)
+                        
+                        if not tx_result['success'] or not tx_result['transactions']:
+                            continue
+                        
+                        latest_tx = tx_result['transactions'][0]
+                        latest_signature = latest_tx['signature']
+                        
+                        last_known_signature = data['last_signatures'].get(wallet_address)
+                        
+                        if last_known_signature and latest_signature != last_known_signature:
+                            data['last_signatures'][wallet_address] = latest_signature
+                            
+                            timestamp = datetime.fromtimestamp(latest_tx['blockTime']).strftime('%Y-%m-%d %H:%M:%S')
+                            status = "✅ Success" if latest_tx.get('err') is None else "❌ Failed"
+                            
+                            notification = (
+                                f"🔔 *New Transaction Detected!*\n\n"
+                                f"📛 Wallet: *{wallet_name}*\n"
+                                f"📍 Address: `{wallet_address[:8]}...{wallet_address[-8:]}`\n"
+                                f"Status: {status}\n"
+                                f"Time: {timestamp}\n"
+                                f"Signature: `{latest_signature[:16]}...`\n\n"
+                            )
+                            
+                            # Get transaction details and parse transfers
+                            tx_details = await get_transaction_details(latest_signature)
+                            if tx_details['success']:
+                                transfers = parse_token_transfers(tx_details['transaction'], wallet_address)
+                                
+                                if transfers:
+                                    notification += "*Token Movements:*\n"
+                                    for transfer in transfers:
+                                        if transfer.get('is_sol'):
+                                            emoji = "📥" if transfer['type'] == 'RECEIVE' else "📤"
+                                            notification += f"{emoji} {transfer['type']}: *{transfer['amount']:.4f} SOL*\n"
+                                        else:
+                                            # Get token metadata
+                                            token_info = await get_token_metadata(transfer['mint'])
+                                            symbol = token_info.get('symbol', 'UNKNOWN')
+                                            emoji = "🟢" if transfer['type'] == 'BUY' else "🔴"
+                                            notification += f"{emoji} {transfer['type']}: *{transfer['amount']:.4f} ${symbol}*\n"
+                                    notification += "\n"
+                            
+                            notification += f"🔗 [View on Solscan](https://solscan.io/tx/{latest_signature})"
+                            
+                            try:
+                                await application.bot.send_message(
+                                    chat
